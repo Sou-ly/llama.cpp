@@ -4,119 +4,93 @@ typedef void (im2col_t)(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
         device        char * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3  tgpg[[threadgroups_per_grid]],
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]);
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]);
 
 template <typename T>
 kernel void kernel_im2col(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
         device        char * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3  tgpg[[threadgroups_per_grid]],
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]) {
-//    const int64_t IC = tgpg[0];
-    const int64_t OH = tgpg[1];
-    const int64_t OW = tgpg[2];
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    constexpr short NT = 32;
+    constexpr short NY = 4;
 
-    const int64_t KH = ntg[1];
-    const int64_t KW = ntg[2];
+    const short tx = tpitg[0];
+    const short ty = tpitg[1];
 
-          int64_t in  = tpitg[0];
-    const int64_t ikh = tpitg[1];
-    const int64_t ikw = tpitg[2];
+    const int32_t chw0 = tgpig[0]*NT;
+    const int32_t ow0  = tgpig[1]*NT;
+    const int32_t ioh  = tgpig[2] % args.OH;
+    const int32_t in   = tgpig[2] / args.OH;
 
-    const int64_t iic = tgpig[0];
-    const int64_t ioh = tgpig[1];
-    const int64_t iow = tgpig[2];
+    {
+        const int32_t iow = ow0 + tx;
 
-    const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
-    const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
+        const int32_t iiw0 = iow*args.s0 - args.p0;
+        const int32_t iih0 = ioh*args.s1 - args.p1;
 
-    int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + (iic*(KH*KW) + ikh*KW + ikw);
+        device const float * xb = x + in*args.ofs0;
 
-    device T * pdst = (device T *) (dst);
+        int32_t chw = chw0 + (NT/NY)*ty;
 
-    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
-        while (in < args.N) {
-            pdst[offset_dst] = 0.0f;
-            offset_dst += ntg[0]*args.CHW*OH*OW;
+        int32_t ikw = chw % args.KW;
+        int32_t ikh = (chw / args.KW) % args.KH;
+        int32_t iic = chw / args.KHW;
 
-            in += ntg[0];
+        for (short j = 0; j < NT/NY; j++) {
+            const short l = (NT/NY)*ty + j;
+
+            float v = 0.0f;
+
+            if (chw < args.CHW && iow < args.OW) {
+                const int32_t iiw = iiw0 + ikw*args.d0;
+                const int32_t iih = iih0 + ikh*args.d1;
+
+                if (iih >= 0 && iih < args.IH && iiw >= 0 && iiw < args.IW) {
+                    v = xb[iic*args.ofs1 + iih*args.IW + iiw];
+                }
+            }
+
+            shmem[(NT + 1)*l + tx] = v;
+
+            chw++;
+            if (++ikw == args.KW) {
+                ikw = 0;
+                if (++ikh == args.KH) {
+                    ikh = 0;
+                    iic++;
+                }
+            }
         }
-    } else {
-        int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
+    }
 
-        while (in < args.N) {
-            pdst[offset_dst] = x[offset_src];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            offset_dst += ntg[0]*args.CHW*OH*OW;
-            offset_src += ntg[0]*args.ofs0;
+    {
+        const int32_t chw = chw0 + tx;
 
-            in += ntg[0];
+        if (chw >= args.CHW) {
+            return;
+        }
+
+        device T * pdst = (device T *) dst + ((int64_t) (in*args.OH + ioh)*args.OW + ow0)*args.CHW + chw;
+
+        for (short j = 0; j < NT/NY; j++) {
+            const short l = (NT/NY)*ty + j;
+
+            if (ow0 + l < args.OW) {
+                pdst[l*args.CHW] = shmem[(NT + 1)*tx + l];
+            }
         }
     }
 }
 
 template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
 template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
-
-// TODO: optimize
-typedef void (im2col_ext_t)(
-        constant ggml_metal_kargs_im2col & args,
-        device const float * x,
-        device        char * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3  tgpg[[threadgroups_per_grid]],
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]);
-
-template <typename T>
-kernel void kernel_im2col_ext(
-        constant ggml_metal_kargs_im2col & args,
-        device const float * x,
-        device        char * dst,
-        uint3 tgpig[[threadgroup_position_in_grid]],
-        uint3  tgpg[[threadgroups_per_grid]],      // tgpg[0] = D x IC x KH x KW, CHW = IC x KH x KW
-        uint3 tpitg[[thread_position_in_threadgroup]],
-        uint3   ntg[[threads_per_threadgroup]]) {  // [M, 1, 1]
-    const int64_t KHW = (int64_t)args.KHW;
-
-    const int64_t d   = tgpig[0] / args.CHW;
-    const int64_t chw = tgpig[0] % args.CHW;
-    const int64_t tgpig_0 = chw / KHW;  // 0 ~ (IC - 1)
-    const int64_t HW = tgpig[0] % KHW;
-
-    const int64_t tpitg_0 = (d * ntg[0]) + tpitg[0];
-    if (tpitg_0 >= args.N) {
-        return;
-    }
-
-    const int64_t tpitg_1 = HW / args.KW;
-    const int64_t tpitg_2 = HW % args.KW;
-
-    const int64_t iiw = tgpig[2] * args.s0 + tpitg_2 * args.d0 - args.p0;
-    const int64_t iih = tgpig[1] * args.s1 + tpitg_1 * args.d1 - args.p1;
-
-    const int64_t offset_dst =
-        (tpitg_0 * tgpg[1] * tgpg[2] + tgpig[1] * tgpg[2] + tgpig[2]) * args.CHW +
-        (tgpig_0 * KHW + tpitg_1 * args.KW + tpitg_2);
-
-    device T * pdst = (device T *) (dst);
-
-    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
-        pdst[offset_dst] = 0.0f;
-    } else {
-        const int64_t offset_src = tpitg_0 * args.ofs0 + tgpig_0 * args.ofs1;
-        pdst[offset_dst] = x[offset_src + iih * args.IW + iiw];
-    }
-}
-
-template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
-template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
 
 template <typename T>
 kernel void kernel_col2im_1d(

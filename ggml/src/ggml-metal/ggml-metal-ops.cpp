@@ -4210,6 +4210,8 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
         /*.d0   =*/ d0,
         /*.d1   =*/ d1,
         /*.N    =*/ N,
+        /*.OW   =*/ OW,
+        /*.OH   =*/ OH,
         /*.KH   =*/ KH,
         /*.KW   =*/ KW,
         /*.KHW  =*/ KH * KW,
@@ -4217,26 +4219,14 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
 
-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
-        const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
-        ggml_metal_encoder_set_pipeline(enc, pipeline);
-        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
-    } else {
-        const uint64_t n_threads = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), N);
-        const int64_t  quotient  = N / n_threads + (N % n_threads > 0 ? 1 : 0);
-
-        ggml_metal_encoder_set_pipeline(enc, pipeline);
-        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
-
-        ggml_metal_encoder_dispatch_threadgroups(enc, quotient * CHW, OH, OW, n_threads, 1, 1);
-    }
+    ggml_metal_encoder_dispatch_threadgroups(enc, (CHW + 31)/32, (OW + 31)/32, OH*N, 32, 4, 1);
 
     return 1;
 }

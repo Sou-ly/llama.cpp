@@ -734,6 +734,8 @@ typedef struct {
     int32_t  d0;
     int32_t  d1;
     int32_t  N;
+    int32_t  OW;
+    int32_t  OH;
     int32_t  KH;
     int32_t  KW;
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
